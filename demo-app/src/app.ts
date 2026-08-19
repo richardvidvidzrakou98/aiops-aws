@@ -343,33 +343,46 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     el.className = 'sim-feedback' + (isErr ? ' err' : '');
   }
 
+  // Sync UI from server — the server is the source of truth.
+  async function syncSimState() {
+    try {
+      const r = await fetch('/api/demo/simulate/cpu/status', { cache: 'no-store' });
+      if (!r.ok) return;
+      const s = await r.json();
+      if (s.active) {
+        const secs = s.remainingSeconds;
+        const detail = secs
+          ? 'Simulation active \u00b7 ' + Math.ceil(secs / 60) + ' min remaining.'
+          : 'CPU load is intentionally elevated for the demonstration.';
+        setDemoState('Simulation Active', detail);
+      } else {
+        // Only reset to Ready if we are not mid-action
+        if (!simBusy) setDemoState('Ready');
+      }
+    } catch { /* non-fatal */ }
+  }
+
   async function startSim() {
     if (simBusy) return;
     simBusy = true;
     const btn = document.getElementById('btn-start');
     btn.disabled = true;
     setDemoState('Starting');
-    setFeedback('Starting simulation…', false);
+    setFeedback('Starting simulation\u2026', false);
     try {
       const r = await fetch('/api/demo/simulate/cpu', { method: 'POST', cache: 'no-store' });
       const body = await r.json();
-      if (r.status === 409) {
-        setDemoState('Simulation Active', 'Simulation already running.');
-        setFeedback('', false);
-      } else if (!r.ok) {
-        setDemoState('Ready');
+      if (!r.ok && r.status !== 409) {
         setFeedback('Unable to start simulation: ' + (body.message || r.status), true);
       } else {
-        const mins = body.duration ? Math.round(body.duration / 60) + ' minute' + (body.duration >= 120 ? 's' : '') : '';
-        setDemoState('Simulation Active', mins ? 'Simulation active · ' + mins + '.' : 'CPU load is intentionally elevated.');
         setFeedback('', false);
       }
     } catch {
-      setDemoState('Ready');
       setFeedback('Unable to start simulation.', true);
     } finally {
       btn.disabled = false;
       simBusy = false;
+      await syncSimState();
     }
   }
 
@@ -379,24 +392,22 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
     const btn = document.getElementById('btn-stop');
     btn.disabled = true;
     setDemoState('Stopping');
-    setFeedback('Stopping simulation…', false);
+    setFeedback('Stopping simulation\u2026', false);
     try {
       const r = await fetch('/api/demo/simulate/cpu/stop', { method: 'POST', cache: 'no-store' });
       if (!r.ok) {
         const body = await r.json().catch(() => ({}));
-        setDemoState('Simulation Active');
         setFeedback('Unable to stop simulation: ' + (body.message || r.status), true);
       } else {
-        setDemoState('Stopped');
         setFeedback('CPU simulation stopped.', false);
         await refreshMetrics();
       }
     } catch {
-      setDemoState('Simulation Active');
       setFeedback('Unable to stop simulation.', true);
     } finally {
       btn.disabled = false;
       simBusy = false;
+      await syncSimState();
     }
   }
 
@@ -405,8 +416,11 @@ button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
   document.getElementById('btn-stop').addEventListener('click', stopSim);
   document.getElementById('btn-refresh').addEventListener('click', refreshMetrics);
 
+  // Fetch server state immediately on load, then keep in sync every 5 s.
   refreshMetrics();
+  syncSimState();
   setInterval(refreshMetrics, 5000);
+  setInterval(syncSimState, 5000);
 }());
 </script>
 </body>

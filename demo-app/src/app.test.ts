@@ -47,29 +47,36 @@ test("internal simulate/cpu requires token", async (t) => {
   assert.equal(wrongToken.status, 401);
 });
 
+test("status endpoint returns inactive initially", async (t) => {
+  const { baseUrl, close } = await startServer();
+  t.after(close);
+
+  const r = await fetch(`${baseUrl}/api/demo/simulate/cpu/status`);
+  assert.equal(r.status, 200);
+  const body = await r.json() as { active: boolean };
+  assert.equal(body.active, false);
+});
+
 test("demo proxy simulation lifecycle", async (t) => {
   const { baseUrl, close } = await startServer();
   t.after(close);
 
-  // Initial state: not active
-  const state = await fetch(`${baseUrl}/api/demo/simulate/cpu`);
-  assert.equal(state.status, 200);
-  assert.equal((await state.json()).active, false);
-
   // Start simulation
   const start = await fetch(`${baseUrl}/api/demo/simulate/cpu`, { method: "POST" });
   assert.equal(start.status, 202);
-  const startBody = await start.json() as { status: string; duration: number };
+  const startBody = await start.json() as { status: string };
   assert.equal(startBody.status, "started");
-  assert.ok(startBody.duration > 0);
+
+  // Status is now active with remainingSeconds
+  const active = await fetch(`${baseUrl}/api/demo/simulate/cpu/status`);
+  assert.equal(active.status, 200);
+  const activeBody = await active.json() as { active: boolean; remainingSeconds: number };
+  assert.equal(activeBody.active, true);
+  assert.ok(typeof activeBody.remainingSeconds === "number" && activeBody.remainingSeconds > 0);
 
   // Concurrent start returns 409
   const conflict = await fetch(`${baseUrl}/api/demo/simulate/cpu`, { method: "POST" });
   assert.equal(conflict.status, 409);
-
-  // State now active
-  const activeState = await fetch(`${baseUrl}/api/demo/simulate/cpu`);
-  assert.equal((await activeState.json()).active, true);
 
   // Stop simulation
   const stop = await fetch(`${baseUrl}/api/demo/simulate/cpu/stop`, { method: "POST" });
@@ -78,9 +85,24 @@ test("demo proxy simulation lifecycle", async (t) => {
   assert.equal(stopBody.status, "stopped");
   assert.equal(stopBody.wasActive, true);
 
-  // State back to inactive
-  const idleState = await fetch(`${baseUrl}/api/demo/simulate/cpu`);
-  assert.equal((await idleState.json()).active, false);
+  // Status back to inactive
+  const idle = await fetch(`${baseUrl}/api/demo/simulate/cpu/status`);
+  assert.equal((await idle.json() as { active: boolean }).active, false);
+});
+
+test("simulation expires automatically after duration", async (t) => {
+  const { baseUrl, close } = await startServer();
+  t.after(close);
+
+  // Start with 1-second duration
+  const start = await fetch(`${baseUrl}/api/demo/simulate/cpu?duration=1`, { method: "POST" });
+  assert.equal(start.status, 202);
+
+  // Wait for expiration
+  await new Promise(resolve => setTimeout(resolve, 1500));
+
+  const status = await fetch(`${baseUrl}/api/demo/simulate/cpu/status`);
+  assert.equal((await status.json() as { active: boolean }).active, false);
 });
 
 test("demo proxy rejects invalid duration", async (t) => {
@@ -104,6 +126,16 @@ test("homepage does not expose control token", async (t) => {
   assert.ok(html.includes("/api/demo/simulate/cpu"), "page should reference demo proxy route");
 });
 
+test("status endpoint does not expose control token", async (t) => {
+  const { baseUrl, close } = await startServer();
+  t.after(close);
+
+  const r = await fetch(`${baseUrl}/api/demo/simulate/cpu/status`);
+  const text = await r.text();
+  assert.ok(!text.includes("test-token"));
+  assert.ok(!text.includes("DEMO_CONTROL_TOKEN"));
+});
+
 test("internal simulate/cpu works with correct token", async (t) => {
   const { baseUrl, close } = await startServer();
   t.after(close);
@@ -114,7 +146,6 @@ test("internal simulate/cpu works with correct token", async (t) => {
   });
   assert.equal(start.status, 202);
 
-  // Clean up
   await fetch(`${baseUrl}/internal/simulate/cpu/stop`, {
     method: "POST",
     headers: { authorization: "Bearer test-token" }

@@ -65,6 +65,11 @@ export function createSystemRouter(cpu: CpuService, controlToken: string, log: L
     response.json(cpu.getSimulation());
   });
 
+  // Explicit status endpoint — preferred by the frontend for state sync.
+  router.get("/api/demo/simulate/cpu/status", (_request, response) => {
+    response.json(cpu.getSimulation());
+  });
+
   router.post("/api/demo/simulate/cpu", (request, response) => {
     const duration = getDuration(request.query.duration);
     if (!duration) {
