@@ -38,10 +38,13 @@ export function createApp(options: AppOptions): express.Express {
         directives: {
           scriptSrc: [
             "'self'",
-            (_request, response) => `'nonce-${(response as unknown as Response).locals.cspNonce}'`
-          ]
+            (_request, response) =>
+              `'nonce-${(response as unknown as Response).locals.cspNonce}'`
+          ],
+          upgradeInsecureRequests: null
         }
-      }
+      },
+      strictTransportSecurity: false
     })
   );
   // This service is accessed from its own origin; no cross-origin browser access is required.
