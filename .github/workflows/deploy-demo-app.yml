@@ -155,7 +155,15 @@ jobs:
           ln -sfn "$release_dir" "${app_root}/current"
           systemctl restart aiops-demo-app
 
-          if ! curl --fail --silent --show-error --retry 6 --retry-delay 2 http://127.0.0.1:3000/health/ready >/dev/null; then
+          if ! curl \
+            --fail \
+            --silent \
+            --show-error \
+            --retry 15 \
+            --retry-delay 2 \
+            --retry-connrefused \
+            --max-time 5 \
+            http://127.0.0.1:3000/health/ready >/dev/null; then
             if [[ -n "$previous_release" && -f "${previous_release}/.ready" ]]; then
               ln -sfn "$previous_release" "${app_root}/current"
               systemctl restart aiops-demo-app
