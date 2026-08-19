@@ -110,8 +110,8 @@ jobs:
           #!/usr/bin/env bash
           set -euo pipefail
 
-          release_sha="${RELEASE_SHA}"
-          deployment_bucket="${DEPLOYMENT_BUCKET}"
+          release_sha="__RELEASE_SHA__"
+          deployment_bucket="__DEPLOYMENT_BUCKET__"
           app_root="/opt/aiops-demo-app"
           release_dir="${app_root}/releases/${release_sha}"
           staging_dir="${release_dir}.staging-$$"
@@ -175,6 +175,11 @@ jobs:
 
           echo "Deployment verified: ${release_sha}"
           SCRIPT
+
+          sed -i \
+            -e "s/__RELEASE_SHA__/${RELEASE_SHA}/g" \
+            -e "s/__DEPLOYMENT_BUCKET__/${DEPLOYMENT_BUCKET}/g" \
+            /tmp/aiops-demo-app-deploy.sh
 
           jq -n --rawfile command /tmp/aiops-demo-app-deploy.sh '{commands: [$command]}' \
             > /tmp/aiops-demo-app-ssm-parameters.json
