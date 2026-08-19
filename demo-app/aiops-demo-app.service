@@ -1,0 +1,20 @@
+[Unit]
+Description=AIOps Demo Application
+After=network.target
+
+[Service]
+Type=simple
+User=aiops
+Group=aiops
+WorkingDirectory=/opt/aiops-demo-app/current
+EnvironmentFile=/opt/aiops-demo-app/config/production.env
+EnvironmentFile=/opt/aiops-demo-app/current/.env
+ExecStart=/usr/bin/node /opt/aiops-demo-app/current/dist/server.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=aiops-demo-app
+
+[Install]
+WantedBy=multi-user.target

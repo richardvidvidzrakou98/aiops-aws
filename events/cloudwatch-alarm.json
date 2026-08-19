@@ -1,0 +1,13 @@
+{
+  "version": "0",
+  "id": "test-event-001",
+  "source": "aiops.test",
+  "detail-type": "CloudWatch Alarm State Change",
+  "detail": {
+    "alarmName": "AIOps-Test-HighCPU",
+    "state": {
+      "value": "ALARM",
+      "reason": "Testing AIOps incident workflow"
+    }
+  }
+}

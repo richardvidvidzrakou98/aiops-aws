@@ -1,0 +1,294 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Intelligent Cloud Automation - AIOps MVP
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-0fd9c4fa5b18e4ee5
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-03c8974ca9eaf6d23
+  AmiId:
+    Type: String
+    Default: ami-0332d564d76dbd8d6
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  GeminiApiKey:
+    Type: String
+    NoEcho: true
+  DeploymentBucketName:
+    Type: String
+    Default: aiops-demo-deploy-056793557028
+    Description: Existing S3 bucket used for immutable demo-app release artifacts
+  GitHubRepository:
+    Type: String
+    AllowedPattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
+    ConstraintDescription: Must be the GitHub repository in OWNER/REPOSITORY format
+    Description: Only this GitHub repository can assume the deployment role
+  DeploymentBranch:
+    Type: String
+    Default: main
+    AllowedPattern: "^[A-Za-z0-9_./-]+$"
+    Description: Git branch permitted to deploy the demo application
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Timeout: 30
+    MemorySize: 256
+    Architectures:
+      - x86_64
+
+Resources:
+  # -----------------------------------------
+  # AIOps EC2 Security Group
+  # -----------------------------------------
+  AIOpsEC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: AIOps MVP demo EC2 security group
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: AIOps-Demo-SG
+
+  # -----------------------------------------
+  # AIOps EC2 IAM Role
+  # -----------------------------------------
+  AIOpsEC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: DemoAppDeploymentRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${DeploymentBucketName}/releases/*
+
+  # -----------------------------------------
+  # GitHub Actions OIDC and deployment role
+  # -----------------------------------------
+  GitHubActionsOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+
+  AIOpsDemoAppDeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AIOpsDemoAppDeploymentRole
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !GetAtt GitHubActionsOidcProvider.Arn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepository}:ref:refs/heads/${DeploymentBranch}
+      Policies:
+        - PolicyName: DemoAppArtifactWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub arn:${AWS::Partition}:s3:::${DeploymentBucketName}
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${DeploymentBucketName}/releases/*
+        - PolicyName: DemoAppInstanceDeployment
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript
+                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${AIOpsEC2}
+              - Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                Resource: "*"
+
+  # -----------------------------------------
+  # AIOps EC2 Instance Profile
+  # -----------------------------------------
+  AIOpsEC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref AIOpsEC2InstanceRole
+
+  # -----------------------------------------
+  # AIOps Demo EC2
+  # -----------------------------------------
+  AIOpsEC2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref AmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref AIOpsEC2SecurityGroup
+      IamInstanceProfile: !Ref AIOpsEC2InstanceProfile
+      Tags:
+        - Key: Name
+          Value: AIOps-Demo-EC2
+        - Key: Project
+          Value: AIOps-MVP
+
+  # -----------------------------------------
+  # AIOps Demo CloudWatch Alarm
+  # -----------------------------------------
+  AIOpsHighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: AIOps-Test-HighCPU
+      AlarmDescription: Trigger the AIOps MVP workflow when EC2 CPU usage is high
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref AIOpsEC2
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 70
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # -----------------------------------------
+  # Incident Notification Topic
+  # -----------------------------------------
+  IncidentTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: aiops-incidents
+
+  # -----------------------------------------
+  # AIOps Coordinator Lambda
+  # -----------------------------------------
+  CoordinatorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: aiops-coordinator
+      CodeUri: .
+      Handler: src/coordinator/app.handler
+      Environment:
+        Variables:
+          GEMINI_API_KEY: !Ref GeminiApiKey
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref IncidentTopic
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+                - ec2:DescribeInstanceStatus
+                - cloudwatch:GetMetricStatistics
+              Resource: "*"
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/coordinator/app.ts
+        Minify: true
+        Target: es2022
+        Sourcemap: false
+        External:
+          - "@aws-sdk/client-cloudwatch"
+          - "@aws-sdk/client-ec2"
+          - "@aws-sdk/client-sns"
+
+  # -----------------------------------------
+  # EventBridge Incident Rule
+  # -----------------------------------------
+  IncidentEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: aiops-cloudwatch-incidents
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          state:
+            value:
+              - ALARM
+      Targets:
+        - Id: CoordinatorLambda
+          Arn: !GetAtt CoordinatorFunction.Arn
+
+  # -----------------------------------------
+  # Allow EventBridge to invoke Lambda
+  # -----------------------------------------
+  CoordinatorEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CoordinatorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt IncidentEventRule.Arn
+
+Outputs:
+  AIOpsEC2:
+    Description: AIOps demo EC2 instance ID
+    Value: !Ref AIOpsEC2
+
+  AIOpsEC2SecurityGroup:
+    Description: Security group for the AIOps demo EC2 instance
+    Value: !Ref AIOpsEC2SecurityGroup
+
+  AIOpsHighCPUAlarm:
+    Description: CloudWatch alarm that drives the AIOps workflow
+    Value: !Ref AIOpsHighCPUAlarm
+
+  CoordinatorFunction:
+    Description: AIOps Coordinator Lambda
+    Value: !GetAtt CoordinatorFunction.Arn
+
+  IncidentTopic:
+    Description: SNS topic for incident notifications
+    Value: !Ref IncidentTopic
+
+  IncidentEventRule:
+    Description: EventBridge incident rule
+    Value: !GetAtt IncidentEventRule.Arn
+
+  DemoAppDeploymentRoleArn:
+    Description: GitHub Actions OIDC role ARN for demo-app deployments
+    Value: !GetAtt AIOpsDemoAppDeploymentRole.Arn
+
+  DeploymentBucketName:
+    Description: S3 bucket containing immutable demo-app releases
+    Value: !Ref DeploymentBucketName

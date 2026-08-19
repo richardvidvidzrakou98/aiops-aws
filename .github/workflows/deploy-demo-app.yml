@@ -1,0 +1,209 @@
+name: Deploy demo application
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "demo-app/**"
+      - ".github/workflows/deploy-demo-app.yml"
+  workflow_dispatch:
+    inputs:
+      release_sha:
+        description: "Existing 7-40 character release SHA to redeploy (leave blank to build the current commit)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: Build and deploy immutable release
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      DEPLOYMENT_BUCKET: ${{ vars.DEPLOYMENT_BUCKET }}
+      INSTANCE_ID: ${{ vars.EC2_INSTANCE_ID }}
+    steps:
+      - name: Determine deployment mode
+        id: mode
+        shell: bash
+        run: |
+          if [[ -n "${{ inputs.release_sha }}" ]]; then
+            echo "redeploy=true" >> "$GITHUB_OUTPUT"
+            echo "sha=${{ inputs.release_sha }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "redeploy=false" >> "$GITHUB_OUTPUT"
+            echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+          release_sha="${{ inputs.release_sha || '' }}"
+          sha="${release_sha:-${GITHUB_SHA::7}}"
+          if [[ ! "$sha" =~ ^[0-9a-f]{7,40}$ ]]; then
+            echo "release_sha must be a 7-40 character lowercase Git SHA" >&2
+            exit 1
+          fi
+
+      # ── New release path ────────────────────────────────────────────────────
+      - name: Check out source
+        if: steps.mode.outputs.redeploy == 'false'
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        if: steps.mode.outputs.redeploy == 'false'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: demo-app/package-lock.json
+
+      - name: Install, test, and build
+        if: steps.mode.outputs.redeploy == 'false'
+        working-directory: demo-app
+        run: |
+          npm ci
+          npm test
+          npm run build
+
+      - name: Package release artifact
+        if: steps.mode.outputs.redeploy == 'false'
+        working-directory: demo-app
+        run: |
+          tar -czf "aiops-demo-app-${{ steps.mode.outputs.sha }}.tgz" \
+            dist package.json package-lock.json README.md
+
+      # ── AWS credentials (both paths need this) ──────────────────────────────
+      - name: Configure AWS credentials through OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/AIOpsDemoAppDeploymentRole
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: demo-app-${{ github.run_id }}
+
+      - name: Upload immutable release
+        if: steps.mode.outputs.redeploy == 'false'
+        working-directory: demo-app
+        run: |
+          aws s3 cp "aiops-demo-app-${{ steps.mode.outputs.sha }}.tgz" \
+            "s3://${DEPLOYMENT_BUCKET}/releases/${{ steps.mode.outputs.sha }}/aiops-demo-app.tgz" \
+            --only-show-errors
+
+      # ── Redeploy path: verify the artifact exists before proceeding ─────────
+      - name: Verify existing release artifact
+        if: steps.mode.outputs.redeploy == 'true'
+        run: |
+          aws s3api head-object \
+            --bucket "${DEPLOYMENT_BUCKET}" \
+            --key "releases/${{ steps.mode.outputs.sha }}/aiops-demo-app.tgz" \
+            --query 'ContentLength' \
+            --output text
+          echo "Artifact confirmed in S3 — redeploying ${{ steps.mode.outputs.sha }}"
+
+      # ── Deploy (both paths) ─────────────────────────────────────────────────
+      - name: Deploy release with SSM Run Command
+        env:
+          RELEASE_SHA: ${{ steps.mode.outputs.sha }}
+        run: |
+          cat > /tmp/aiops-demo-app-deploy.sh <<'SCRIPT'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          release_sha="${RELEASE_SHA}"
+          deployment_bucket="${DEPLOYMENT_BUCKET}"
+          app_root="/opt/aiops-demo-app"
+          release_dir="${app_root}/releases/${release_sha}"
+          staging_dir="${release_dir}.staging-$$"
+          artifact="/tmp/aiops-demo-app-${release_sha}.tgz"
+
+          [[ "$release_sha" =~ ^[0-9a-f]{7,40}$ ]]
+          command -v aws >/dev/null
+          command -v npm >/dev/null
+          command -v curl >/dev/null
+
+          install -d -m 0755 "${app_root}/releases"
+
+          if [[ -d "$release_dir" && ! -f "${release_dir}/.ready" ]]; then
+            echo "Existing release directory is incomplete: ${release_dir}" >&2
+            exit 1
+          fi
+
+          if [[ ! -f "${release_dir}/.ready" ]]; then
+            trap 'rm -rf "$staging_dir" "$artifact"' EXIT
+            aws s3 cp "s3://${deployment_bucket}/releases/${release_sha}/aiops-demo-app.tgz" "$artifact" --only-show-errors
+            install -d -m 0755 "$staging_dir"
+            tar -xzf "$artifact" -C "$staging_dir"
+            (
+              cd "$staging_dir"
+              npm ci --omit=dev
+              # Write only the release identifier — secrets live in config/production.env
+              printf 'APP_VERSION=%s\n' "$release_sha" > .env
+            )
+            touch "${staging_dir}/.ready"
+            mv "$staging_dir" "$release_dir"
+            chown -R aiops:aiops "$release_dir"
+            trap - EXIT
+            rm -f "$artifact"
+          fi
+
+          previous_release=""
+          if [[ -L "${app_root}/current" ]]; then
+            previous_release="$(readlink -f "${app_root}/current")"
+          fi
+
+          ln -sfn "$release_dir" "${app_root}/current"
+          systemctl restart aiops-demo-app
+
+          if ! curl --fail --silent --show-error --retry 6 --retry-delay 2 http://127.0.0.1:3000/health/ready >/dev/null; then
+            if [[ -n "$previous_release" && -f "${previous_release}/.ready" ]]; then
+              ln -sfn "$previous_release" "${app_root}/current"
+              systemctl restart aiops-demo-app
+            fi
+            echo "New release failed its readiness check" >&2
+            exit 1
+          fi
+
+          deployed_version="$(
+            curl --fail --silent http://127.0.0.1:3000/api/system \
+            | jq -r '.version'
+          )"
+          if [[ "$deployed_version" != "$release_sha" ]]; then
+            echo "Version mismatch: expected ${release_sha}, got ${deployed_version}" >&2
+            exit 1
+          fi
+
+          echo "Deployment verified: ${release_sha}"
+          SCRIPT
+
+          jq -n --rawfile command /tmp/aiops-demo-app-deploy.sh '{commands: [$command]}' \
+            > /tmp/aiops-demo-app-ssm-parameters.json
+          command_id="$(aws ssm send-command \
+            --document-name AWS-RunShellScript \
+            --instance-ids "$INSTANCE_ID" \
+            --parameters file:///tmp/aiops-demo-app-ssm-parameters.json \
+            --comment "Deploy aiops-demo-app ${RELEASE_SHA}" \
+            --query 'Command.CommandId' \
+            --output text)"
+
+          for attempt in {1..60}; do
+            status="$(aws ssm get-command-invocation \
+              --command-id "$command_id" \
+              --instance-id "$INSTANCE_ID" \
+              --query Status \
+              --output text 2>/dev/null || true)"
+            case "$status" in
+              Success) exit 0 ;;
+              Failed|Cancelled|TimedOut|Cancelling)
+                aws ssm get-command-invocation \
+                  --command-id "$command_id" \
+                  --instance-id "$INSTANCE_ID" \
+                  --query '{Status:Status,StandardOutputContent:StandardOutputContent,StandardErrorContent:StandardErrorContent}'
+                exit 1
+                ;;
+            esac
+            sleep 5
+          done
+
+          echo "Timed out waiting for SSM command ${command_id}" >&2
+          exit 1
