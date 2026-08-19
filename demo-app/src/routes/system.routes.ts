@@ -58,6 +58,42 @@ export function createSystemRouter(cpu: CpuService, controlToken: string, log: L
     response.json(cpu.snapshot());
   });
 
+  // ── Browser-safe demo control proxy ────────────────────────────────────────
+  // The browser calls these same-origin routes; the token never leaves the server.
+
+  router.get("/api/demo/simulate/cpu", (_request, response) => {
+    response.json(cpu.getSimulation());
+  });
+
+  router.post("/api/demo/simulate/cpu", (request, response) => {
+    const duration = getDuration(request.query.duration);
+    if (!duration) {
+      response.status(400).json({
+        error: "Invalid duration",
+        message: `Duration must be an integer between 1 and ${maxDuration} seconds`
+      });
+      return;
+    }
+
+    if (!cpu.startSimulation(duration)) {
+      response.status(409).json({
+        error: "Simulation already running",
+        message: "Stop the active CPU simulation before starting another one"
+      });
+      return;
+    }
+
+    log("CPU simulation started via demo proxy", { duration });
+    response.status(202).json({ status: "started", duration });
+  });
+
+  router.post("/api/demo/simulate/cpu/stop", (_request, response) => {
+    const stopped = cpu.stopSimulation();
+    if (stopped) log("CPU simulation stopped via demo proxy");
+    response.json({ status: "stopped", wasActive: stopped });
+  });
+
+  // ── Protected internal endpoints (existing contract preserved) ─────────────
   const control = requireControlToken(controlToken, log);
 
   router.post("/internal/simulate/cpu", control, (request, response) => {
