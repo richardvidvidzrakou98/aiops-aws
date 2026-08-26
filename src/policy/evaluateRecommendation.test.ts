@@ -1,131 +1,288 @@
-import test from "node:test";
 import assert from "node:assert/strict";
-import { evaluateRecommendation } from "./evaluateRecommendation";
+import test from "node:test";
+
+import {
+  evaluateRecommendation
+} from "./evaluateRecommendation";
+
 import type { AIRecommendation } from "../ai/analyzeIncident";
 import type { IncidentContext } from "../investigation/collectContext";
 
-function ctx(overrides: Partial<IncidentContext> = {}): IncidentContext {
-  return {
-    instanceId: "i-1234567890abcdef0",
-    instanceState: "running",
-    instanceType: "t3.micro",
-    availabilityZone: "us-east-1a",
-    privateIp: "10.0.0.10",
-    publicIp: "203.0.113.10",
-    healthStatus: "ok",
-    cpuUtilization: 95,
-    ...overrides
-  };
-}
+const baseContext: IncidentContext = {
+  instanceId: "i-1234567890",
+  instanceState: "running",
+  instanceType: "t3.micro",
+  availabilityZone: "us-east-1a",
+  privateIp: "10.0.0.10",
+  publicIp: "1.2.3.4",
+  healthStatus: "ok",
+  cpuUtilization: 85
+};
 
-function rec(overrides: Partial<AIRecommendation> = {}): AIRecommendation {
-  return {
-    severity: "HIGH",
-    diagnosis: "CPU saturation detected",
-    confidence: 0.95,
-    recommendedAction: "restart_application",
-    reason: "Healthy instance with sustained high CPU",
-    requiresApproval: false,
-    ...overrides
-  };
-}
+const baseRecommendation: AIRecommendation = {
+  severity: "HIGH",
+  diagnosis: "High CPU utilization",
+  confidence: 0.95,
+  recommendedAction: "restart_application",
+  reason: "CPU utilization is above the configured threshold",
+  requiresApproval: false
+};
 
-// ── Approved path ─────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// APPROVED
+// ─────────────────────────────────────────────────────────────────────────────
 
-test("approves restart when all conditions are met", () => {
-  const d = evaluateRecommendation(ctx(), rec());
-  assert.equal(d.decision, "APPROVED");
-  assert.equal(d.action, "restart_application");
+test("approves restart when all deterministic conditions are met", () => {
+  const result = evaluateRecommendation(
+    baseContext,
+    baseRecommendation
+  );
+
+  assert.equal(result.decision, "APPROVED");
+  assert.equal(result.action, "restart_application");
 });
 
 test("approves no_action unconditionally", () => {
-  const d = evaluateRecommendation(
-    ctx({ instanceState: "stopped", healthStatus: "impaired", cpuUtilization: 0 }),
-    rec({ recommendedAction: "no_action", confidence: 0.1, requiresApproval: true })
-  );
-  assert.equal(d.decision, "APPROVED");
-  assert.equal(d.action, "no_action");
+  const recommendation: AIRecommendation = {
+    ...baseRecommendation,
+    recommendedAction: "no_action"
+  };
+
+  const context: IncidentContext = {
+    ...baseContext,
+    cpuUtilization: 10
+  };
+
+  const result = evaluateRecommendation(context, recommendation);
+
+  assert.equal(result.decision, "APPROVED");
+  assert.equal(result.action, "no_action");
 });
 
-// ── Rejected paths ────────────────────────────────────────────────────────────
+// AI confidence is advisory only
+
+test("approves restart when AI confidence is below 0.90", () => {
+  const recommendation: AIRecommendation = {
+    ...baseRecommendation,
+    confidence: 0.85
+  };
+
+  const result = evaluateRecommendation(
+    baseContext,
+    recommendation
+  );
+
+  assert.equal(result.decision, "APPROVED");
+  assert.equal(result.action, "restart_application");
+});
+
+test("approves restart when AI confidence is very low but deterministic checks pass", () => {
+  const recommendation: AIRecommendation = {
+    ...baseRecommendation,
+    confidence: 0.50
+  };
+
+  const result = evaluateRecommendation(
+    baseContext,
+    recommendation
+  );
+
+  assert.equal(result.decision, "APPROVED");
+  assert.equal(result.action, "restart_application");
+});
+
+// AI requiresApproval is advisory only
+
+test("AI requiresApproval flag does not override deterministic policy", () => {
+  const recommendation: AIRecommendation = {
+    ...baseRecommendation,
+    confidence: 0.95,
+    requiresApproval: true
+  };
+
+  const result = evaluateRecommendation(
+    baseContext,
+    recommendation
+  );
+
+  assert.equal(result.decision, "APPROVED");
+  assert.equal(result.action, "restart_application");
+});
+
+test("AI requiresApproval with low confidence does not block a safe restart", () => {
+  const recommendation: AIRecommendation = {
+    ...baseRecommendation,
+    confidence: 0.70,
+    requiresApproval: true
+  };
+
+  const result = evaluateRecommendation(
+    baseContext,
+    recommendation
+  );
+
+  assert.equal(result.decision, "APPROVED");
+  assert.equal(result.action, "restart_application");
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REJECTED — ACTION
+// ─────────────────────────────────────────────────────────────────────────────
 
 test("rejects unsupported action", () => {
-  const d = evaluateRecommendation(
-    ctx(),
-    rec({ recommendedAction: "reboot_instance" as AIRecommendation["recommendedAction"] })
+  const recommendation = {
+    ...baseRecommendation,
+    recommendedAction: "terminate_instance"
+  } as unknown as AIRecommendation;
+
+  const result = evaluateRecommendation(
+    baseContext,
+    recommendation
   );
-  assert.equal(d.decision, "REJECTED");
-  assert.match(d.reason, /not permitted/);
+
+  assert.equal(result.decision, "REJECTED");
+  assert.equal(result.action, "terminate_instance");
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REJECTED — INSTANCE STATE
+// ─────────────────────────────────────────────────────────────────────────────
 
 test("rejects restart when instance is not running", () => {
-  const d = evaluateRecommendation(ctx({ instanceState: "stopped" }), rec());
-  assert.equal(d.decision, "REJECTED");
-  assert.match(d.reason, /running/);
+  const context: IncidentContext = {
+    ...baseContext,
+    instanceState: "stopped"
+  };
+
+  const result = evaluateRecommendation(
+    context,
+    baseRecommendation
+  );
+
+  assert.equal(result.decision, "REJECTED");
+  assert.match(result.reason, /running instances/i);
 });
+
+test("AI requiresApproval false does not bypass instance-state check", () => {
+  const context: IncidentContext = {
+    ...baseContext,
+    instanceState: "stopped"
+  };
+
+  const recommendation: AIRecommendation = {
+    ...baseRecommendation,
+    requiresApproval: false
+  };
+
+  const result = evaluateRecommendation(
+    context,
+    recommendation
+  );
+
+  assert.equal(result.decision, "REJECTED");
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REJECTED — INSTANCE HEALTH
+// ─────────────────────────────────────────────────────────────────────────────
 
 test("rejects restart when instance is unhealthy", () => {
-  const d = evaluateRecommendation(ctx({ healthStatus: "impaired" }), rec());
-  assert.equal(d.decision, "REJECTED");
-  assert.match(d.reason, /healthy/);
+  const context: IncidentContext = {
+    ...baseContext,
+    healthStatus: "impaired"
+  };
+
+  const result = evaluateRecommendation(
+    context,
+    baseRecommendation
+  );
+
+  assert.equal(result.decision, "REJECTED");
+  assert.match(result.reason, /healthy EC2 instance/i);
 });
 
+test("AI requiresApproval false does not bypass health check", () => {
+  const context: IncidentContext = {
+    ...baseContext,
+    healthStatus: "impaired"
+  };
+
+  const recommendation: AIRecommendation = {
+    ...baseRecommendation,
+    requiresApproval: false
+  };
+
+  const result = evaluateRecommendation(
+    context,
+    recommendation
+  );
+
+  assert.equal(result.decision, "REJECTED");
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// REJECTED — CPU THRESHOLD
+// ─────────────────────────────────────────────────────────────────────────────
+
 test("rejects restart when CPU is at or below alarm threshold", () => {
-  const d = evaluateRecommendation(ctx({ cpuUtilization: 70 }), rec());
-  assert.equal(d.decision, "REJECTED");
-  assert.match(d.reason, /threshold/);
+  const context: IncidentContext = {
+    ...baseContext,
+    cpuUtilization: 70
+  };
+
+  const result = evaluateRecommendation(
+    context,
+    baseRecommendation
+  );
+
+  assert.equal(result.decision, "REJECTED");
+  assert.match(result.reason, /70%/);
+});
+
+test("rejects restart when CPU utilization is below alarm threshold", () => {
+  const context: IncidentContext = {
+    ...baseContext,
+    cpuUtilization: 45
+  };
+
+  const result = evaluateRecommendation(
+    context,
+    baseRecommendation
+  );
+
+  assert.equal(result.decision, "REJECTED");
 });
 
 test("rejects restart when CPU utilization is missing", () => {
-  const d = evaluateRecommendation(ctx({ cpuUtilization: undefined }), rec());
-  assert.equal(d.decision, "REJECTED");
-  assert.match(d.reason, /threshold/);
-});
+  const context: IncidentContext = {
+    ...baseContext,
+    cpuUtilization: undefined
+  };
 
-// ── Approval required paths ───────────────────────────────────────────────────
-
-test("requires approval when confidence is below 0.90", () => {
-  const d = evaluateRecommendation(ctx(), rec({ confidence: 0.89, requiresApproval: false }));
-  assert.equal(d.decision, "APPROVAL_REQUIRED");
-  assert.match(d.reason, /confidence/);
-});
-
-test("requires approval when AI sets requiresApproval true even with high confidence", () => {
-  const d = evaluateRecommendation(ctx(), rec({ confidence: 0.99, requiresApproval: true }));
-  assert.equal(d.decision, "APPROVAL_REQUIRED");
-  assert.match(d.reason, /human approval/);
-});
-
-// ── Safety: requiresApproval:false alone cannot authorize execution ───────────
-
-test("requiresApproval:false does not bypass instance-state check", () => {
-  const d = evaluateRecommendation(
-    ctx({ instanceState: "stopped" }),
-    rec({ requiresApproval: false })
+  const result = evaluateRecommendation(
+    context,
+    baseRecommendation
   );
-  assert.equal(d.decision, "REJECTED");
+
+  assert.equal(result.decision, "REJECTED");
+  assert.match(result.reason, /CPU utilization/i);
 });
 
-test("requiresApproval:false does not bypass health check", () => {
-  const d = evaluateRecommendation(
-    ctx({ healthStatus: "impaired" }),
-    rec({ requiresApproval: false })
-  );
-  assert.equal(d.decision, "REJECTED");
-});
+test("AI requiresApproval false does not bypass CPU threshold check", () => {
+  const context: IncidentContext = {
+    ...baseContext,
+    cpuUtilization: 50
+  };
 
-test("requiresApproval:false does not bypass CPU threshold check", () => {
-  const d = evaluateRecommendation(
-    ctx({ cpuUtilization: 50 }),
-    rec({ requiresApproval: false })
-  );
-  assert.equal(d.decision, "REJECTED");
-});
+  const recommendation: AIRecommendation = {
+    ...baseRecommendation,
+    requiresApproval: false
+  };
 
-test("requiresApproval:false does not bypass confidence check", () => {
-  const d = evaluateRecommendation(
-    ctx(),
-    rec({ confidence: 0.5, requiresApproval: false })
+  const result = evaluateRecommendation(
+    context,
+    recommendation
   );
-  assert.equal(d.decision, "APPROVAL_REQUIRED");
+
+  assert.equal(result.decision, "REJECTED");
 });

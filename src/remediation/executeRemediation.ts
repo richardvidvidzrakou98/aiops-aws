@@ -63,8 +63,8 @@ export async function executeRemediation(
     throw new Error("SSM command was not created");
   }
 
-  // ── Poll for SSM command completion (max 60 s) ────────────────────────────
-  const ssmStatus = await pollSsmCommand(commandId, context.instanceId, 60);
+  // ── Poll for SSM command completion (max 120 s) ───────────────────────────
+  const ssmStatus = await pollSsmCommand(commandId, context.instanceId, 120);
   if (ssmStatus !== "Success") {
     return {
       action,

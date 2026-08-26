@@ -2,6 +2,7 @@ import cors from "cors";
 import { randomBytes } from "node:crypto";
 import express, { type NextFunction, type Request, type Response } from "express";
 import helmet from "helmet";
+import { requestLogger } from "./middleware/logger.middleware";
 import { createHealthRouter } from "./routes/health.routes";
 import { createSystemRouter } from "./routes/system.routes";
 import { CpuService } from "./services/cpu.service";
@@ -454,6 +455,7 @@ export function createApp(options: AppOptions): express.Express {
   // This service is accessed from its own origin; no cross-origin browser access is required.
   app.use(cors({ origin: false }));
   app.use(express.json({ limit: "8kb" }));
+  app.use(requestLogger);
 
   app.get("/", (_request, response) => {
     response.type("html").send(homepage(response.locals.cspNonce));

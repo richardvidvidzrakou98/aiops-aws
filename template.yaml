@@ -20,6 +20,9 @@ Parameters:
   GeminiApiKey:
     Type: String
     NoEcho: true
+  ReportsEmailAddress:
+    Type: String
+    Description: Email address to receive daily AIOps reports
   DeploymentBucketName:
     Type: String
     Default: aiops-demo-deploy-056793557028
@@ -60,6 +63,7 @@ Resources:
             Action: sts:AssumeRole
       ManagedPolicyArns:
         - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
       Policies:
         - PolicyName: DemoAppDeploymentRead
           PolicyDocument:
@@ -116,6 +120,106 @@ Resources:
       Threshold: 70
       ComparisonOperator: GreaterThanThreshold
       TreatMissingData: notBreaching
+
+  # -----------------------------------------
+  # CloudWatch Log Groups (application logs)
+  # -----------------------------------------
+  ApplicationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aiops/demo-app/application
+      RetentionInDays: 30
+
+  ErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aiops/demo-app/errors
+      RetentionInDays: 30
+
+  # -----------------------------------------
+  # Daily Reports SNS Topic
+  # -----------------------------------------
+  ReportsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: aiops-reports
+
+  ReportsTopicEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ReportsTopic
+      Protocol: email
+      Endpoint: !Ref ReportsEmailAddress
+
+  # -----------------------------------------
+  # AIOps Analytics Engine Lambda
+  # -----------------------------------------
+  AnalyticsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: aiops-analytics
+      CodeUri: .
+      Handler: src/analytics/dailyReport.handler
+      Timeout: 300
+      Environment:
+        Variables:
+          GEMINI_API_KEY: !Ref GeminiApiKey
+          REPORTS_TOPIC_ARN: !Ref ReportsTopic
+          EC2_INSTANCE_ID: !Ref AIOpsEC2
+          APP_LOG_GROUP: /aiops/demo-app/application
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref ReportsTopic
+            - Effect: Allow
+              Action:
+                - cloudwatch:GetMetricStatistics
+              Resource: "*"
+            - Effect: Allow
+              Action:
+                - logs:StartQuery
+                - logs:GetQueryResults
+                - logs:StopQuery
+              Resource:
+                - !GetAtt ApplicationLogGroup.Arn
+                - !GetAtt ErrorLogGroup.Arn
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        EntryPoints:
+          - src/analytics/dailyReport.ts
+        Minify: true
+        Target: es2022
+        Sourcemap: false
+        External:
+          - "@aws-sdk/client-cloudwatch"
+          - "@aws-sdk/client-cloudwatch-logs"
+          - "@aws-sdk/client-sns"
+
+  # -----------------------------------------
+  # EventBridge Daily Schedule
+  # -----------------------------------------
+  DailyReportSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: aiops-daily-report
+      Description: Trigger the AIOps Analytics Engine every day at midnight UTC
+      ScheduleExpression: cron(0 0 * * ? *)
+      State: ENABLED
+      Targets:
+        - Id: AnalyticsLambda
+          Arn: !GetAtt AnalyticsFunction.Arn
+
+  AnalyticsEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AnalyticsFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailyReportSchedule.Arn
 
   # -----------------------------------------
   # Incident Notification Topic
@@ -231,6 +335,18 @@ Outputs:
   IncidentEventRule:
     Description: EventBridge incident rule
     Value: !GetAtt IncidentEventRule.Arn
+
+  AnalyticsFunction:
+    Description: AIOps Analytics Engine Lambda
+    Value: !GetAtt AnalyticsFunction.Arn
+
+  ReportsTopic:
+    Description: SNS topic for daily AIOps reports
+    Value: !Ref ReportsTopic
+
+  DailyReportSchedule:
+    Description: EventBridge rule for daily analytics
+    Value: !GetAtt DailyReportSchedule.Arn
 
   DeploymentBucketName:
     Description: S3 bucket containing immutable demo-app releases
