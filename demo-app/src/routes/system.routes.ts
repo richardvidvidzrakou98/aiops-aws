@@ -3,7 +3,7 @@ import { Router, type Request, type Response } from "express";
 import type { CpuService } from "../services/cpu.service";
 
 const service = "aiops-demo-app";
-const defaultDuration = 300;
+const defaultDuration = 540;
 const maxDuration = 600;
 
 type Log = (event: string, details?: Record<string, unknown>) => void;

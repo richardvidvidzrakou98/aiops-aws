@@ -7,7 +7,7 @@ s3_prefix = "aiops-mvp"
 confirm_changeset = true
 capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
 image_repositories = []
-parameter_overrides = "VpcId=\"vpc-0fd9c4fa5b18e4ee5\" SubnetId=\"subnet-03c8974ca9eaf6d23\" AmiId=\"ami-0332d564d76dbd8d6\" InstanceType=\"t3.micro\" GitHubRepository=\"<owner>/<repo>\" GeminiApiKey=\"<your-key>\""
+parameter_overrides = "VpcId=\"vpc-0fd9c4fa5b18e4ee5\" SubnetId=\"subnet-03c8974ca9eaf6d23\" AmiId=\"ami-0332d564d76dbd8d6\" InstanceType=\"t3.micro\" GitHubRepository=\"richardvidvidzrakou98/aiops-aws\" GeminiApiKey=\"<your-key>\""
 
 [default.global.parameters]
 region = "us-east-1"

@@ -36,7 +36,9 @@ Rules:
 - Never recommend an action outside the allowed actions.
 - Do not execute or describe AWS commands.
 - If the evidence is insufficient, use "no_action".
-- High CPU with a healthy EC2 instance may justify "restart_application".`;
+- High CPU with a healthy EC2 instance may justify "restart_application".
+- Set requiresApproval to false only when confidence >= 0.90 and the instance is healthy and CPU is clearly elevated.
+- Set requiresApproval to true when evidence is ambiguous or confidence is below 0.90.`;
 
   const response = await ai.models.generateContent({
     model: "gemini-3.5-flash-lite",
@@ -62,16 +64,8 @@ Rules:
 function validateRecommendation(
   recommendation: AIRecommendation
 ): void {
-  const allowedSeverities = [
-    "LOW",
-    "MEDIUM",
-    "HIGH",
-    "CRITICAL"
-  ];
-  const allowedActions = [
-    "restart_application",
-    "no_action"
-  ];
+  const allowedSeverities = ["LOW", "MEDIUM", "HIGH", "CRITICAL"];
+  const allowedActions = ["restart_application", "no_action"];
 
   if (!allowedSeverities.includes(recommendation.severity)) {
     throw new Error("Invalid AI severity");

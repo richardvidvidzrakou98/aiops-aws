@@ -24,17 +24,6 @@ Parameters:
     Type: String
     Default: aiops-demo-deploy-056793557028
     Description: Existing S3 bucket used for immutable demo-app release artifacts
-  GitHubRepository:
-    Type: String
-    AllowedPattern: "^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"
-    ConstraintDescription: Must be the GitHub repository in OWNER/REPOSITORY format
-    Description: Only this GitHub repository can assume the deployment role
-  DeploymentBranch:
-    Type: String
-    Default: main
-    AllowedPattern: "^[A-Za-z0-9_./-]+$"
-    Description: Git branch permitted to deploy the demo application
-
 Globals:
   Function:
     Runtime: nodejs22.x
@@ -80,61 +69,6 @@ Resources:
                 Action:
                   - s3:GetObject
                 Resource: !Sub arn:${AWS::Partition}:s3:::${DeploymentBucketName}/releases/*
-
-  # -----------------------------------------
-  # GitHub Actions OIDC and deployment role
-  # -----------------------------------------
-  GitHubActionsOidcProvider:
-    Type: AWS::IAM::OIDCProvider
-    Properties:
-      Url: https://token.actions.githubusercontent.com
-      ClientIdList:
-        - sts.amazonaws.com
-
-  AIOpsDemoAppDeploymentRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: AIOpsDemoAppDeploymentRole
-      MaxSessionDuration: 3600
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Federated: !GetAtt GitHubActionsOidcProvider.Arn
-            Action: sts:AssumeRoleWithWebIdentity
-            Condition:
-              StringEquals:
-                token.actions.githubusercontent.com:aud: sts.amazonaws.com
-                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubRepository}:ref:refs/heads/${DeploymentBranch}
-      Policies:
-        - PolicyName: DemoAppArtifactWrite
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action:
-                  - s3:ListBucket
-                Resource: !Sub arn:${AWS::Partition}:s3:::${DeploymentBucketName}
-              - Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:PutObject
-                Resource: !Sub arn:${AWS::Partition}:s3:::${DeploymentBucketName}/releases/*
-        - PolicyName: DemoAppInstanceDeployment
-          PolicyDocument:
-            Version: "2012-10-17"
-            Statement:
-              - Effect: Allow
-                Action:
-                  - ssm:SendCommand
-                Resource:
-                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript
-                  - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${AIOpsEC2}
-              - Effect: Allow
-                Action:
-                  - ssm:GetCommandInvocation
-                Resource: "*"
 
   # -----------------------------------------
   # AIOps EC2 Instance Profile
@@ -200,9 +134,11 @@ Resources:
       FunctionName: aiops-coordinator
       CodeUri: .
       Handler: src/coordinator/app.handler
+      Timeout: 480
       Environment:
         Variables:
           GEMINI_API_KEY: !Ref GeminiApiKey
+          SNS_TOPIC_ARN: !Ref IncidentTopic
       Policies:
         - AWSLambdaBasicExecutionRole
         - Statement:
@@ -216,6 +152,16 @@ Resources:
                 - ec2:DescribeInstanceStatus
                 - cloudwatch:GetMetricStatistics
               Resource: "*"
+            - Effect: Allow
+              Action:
+                - ssm:SendCommand
+              Resource:
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript
+                - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/${AIOpsEC2}
+            - Effect: Allow
+              Action:
+                - ssm:GetCommandInvocation
+              Resource: "*"
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
@@ -228,6 +174,7 @@ Resources:
           - "@aws-sdk/client-cloudwatch"
           - "@aws-sdk/client-ec2"
           - "@aws-sdk/client-sns"
+          - "@aws-sdk/client-ssm"
 
   # -----------------------------------------
   # EventBridge Incident Rule
@@ -284,10 +231,6 @@ Outputs:
   IncidentEventRule:
     Description: EventBridge incident rule
     Value: !GetAtt IncidentEventRule.Arn
-
-  DemoAppDeploymentRoleArn:
-    Description: GitHub Actions OIDC role ARN for demo-app deployments
-    Value: !GetAtt AIOpsDemoAppDeploymentRole.Arn
 
   DeploymentBucketName:
     Description: S3 bucket containing immutable demo-app releases
