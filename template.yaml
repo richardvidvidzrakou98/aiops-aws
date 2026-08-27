@@ -23,6 +23,9 @@ Parameters:
   ReportsEmailAddress:
     Type: String
     Description: Email address to receive daily AIOps reports
+  IncidentEmailAddress:
+    Type: String
+    Description: Email address to receive incident notifications
   DeploymentBucketName:
     Type: String
     Default: aiops-demo-deploy-056793557028
@@ -229,6 +232,13 @@ Resources:
     Properties:
       TopicName: aiops-incidents
 
+  IncidentTopicEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref IncidentTopic
+      Protocol: email
+      Endpoint: !Ref IncidentEmailAddress
+
   # -----------------------------------------
   # AIOps Coordinator Lambda
   # -----------------------------------------
@@ -238,7 +248,7 @@ Resources:
       FunctionName: aiops-coordinator
       CodeUri: .
       Handler: src/coordinator/app.handler
-      Timeout: 480
+      Timeout: 540
       Environment:
         Variables:
           GEMINI_API_KEY: !Ref GeminiApiKey

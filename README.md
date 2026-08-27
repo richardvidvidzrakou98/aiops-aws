@@ -1,6 +1,6 @@
 # Building Intelligent Cloud Automation on AWS
 
-Autonomous incident detection and remediation on AWS — a fully event-driven AIOps pipeline that detects a real infrastructure incident, reasons about it with a large language model, enforces a safety policy, and remediates without human intervention.
+Autonomous incident detection and remediation on AWS — a fully event-driven AIOps pipeline that detects a real infrastructure incident, reasons about it with a large language model, enforces a safety policy, and remediates without human intervention. A scheduled Analytics Engine complements the reactive pipeline by turning each day's metrics and application logs into an AI-written report delivered by email.
 
 ---
 
@@ -9,6 +9,7 @@ Autonomous incident detection and remediation on AWS — a fully event-driven AI
 - [Overview](#overview)
 - [Architecture](#architecture)
 - [How It Works](#how-it-works)
+- [Daily Report Pipeline](#daily-report-pipeline)
 - [Repository Layout](#repository-layout)
 - [Source Modules](#source-modules)
 - [Demo Application](#demo-application)
@@ -38,57 +39,203 @@ This project demonstrates a production-grade AIOps pattern on AWS. When a CloudW
 
 The AI never executes arbitrary commands. Every remediation action is a hardcoded mapping inside the Lambda. The policy independently verifies all safety conditions regardless of what the AI returns.
 
+In parallel, a scheduled **Analytics Engine** runs every night at 00:00 UTC: it aggregates the last 24 hours of CloudWatch metrics and application logs, has Gemini interpret the verified numbers, and publishes a daily report to a separate SNS topic.
+
 ---
 
 ## Architecture
 
-![Architecture diagram](docs/ARCHITECTURE.png)
+![Architecture diagram](demo-app/docs/ARCHITECTURE.png)
+
+### Incident Response Pipeline
 
 ```
-GitHub Actions                    CloudWatch Alarm (CPU > 70%)
-      │                                      │
-      │  deploy                              │ state → ALARM
-      ▼                                      ▼
-   S3 Bucket                           EventBridge Rule
-      │                                      │
-      │  SSM Run Command                     │ invoke
-      ▼                                      ▼
-EC2 (aiops-demo-app) ◄──────── Coordinator Lambda
-                                             │
-                          ┌──────────────────┼──────────────────┐
-                          ▼                  ▼                  ▼
-                    Investigation       Gemini AI           Policy Engine
-                    (EC2 + CW)         Analysis            (independent
-                    collectContext     analyzeIncident      safety checks)
-                                                                │
-                                                    APPROVED / REJECTED /
-                                                    APPROVAL_REQUIRED
-                                                                │
-                                                    ┌───────────┘
-                                                    ▼
-                                             SSM Run Command
-                                        (systemctl restart aiops-demo-app)
-                                                    │
-                                                    ▼
-                                          Poll for SSM Success
-                                                    │
-                                                    ▼
-                                       Wait for fresh CW datapoint
-                                                    │
-                                          CPU recovered?
-                                          ├── YES → RESOLVED
-                                          └── NO  → REMEDIATION_FAILED
-                                                    │
-                                                    ▼
-                                              SNS Notification
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         INCIDENT DETECTION & RESPONSE                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                      CloudWatch Alarm (CPU > 70%)
+                                  │
+                                  │ state → ALARM
+                                  ▼
+                          EventBridge Rule
+                                  │
+                                  │ invoke
+                                  ▼
+                      ┌─────────────────────────┐
+                      │   Coordinator Lambda    │
+                      │   (aiops-coordinator)   │
+                      └─────────────────────────┘
+                                  │
+        ┌─────────────────────────┼─────────────────────────┐
+        │                         │                         │
+        ▼                         ▼                         ▼
+┌───────────────┐      ┌──────────────────┐      ┌─────────────────┐
+│ Investigation │      │   Gemini AI      │      │ Policy Engine   │
+│               │      │   Analysis       │      │ (independent    │
+│ • EC2 State   │      │                  │      │  safety gate)   │
+│ • Health      │──────▶ analyzeIncident  │──────▶                 │
+│ • CPU Metric  │      │                  │      │ • Verify action │
+│               │      │ gemini-3.5-      │      │ • Check state   │
+│ collectContext│      │ flash-lite       │      │ • Check health  │
+└───────────────┘      └──────────────────┘      │ • Verify CPU    │
+                                                  └─────────────────┘
+                                                          │
+                                   ┌──────────────────────┤
+                                   │                      │
+                              APPROVED                REJECTED
+                                   │                      │
+                                   ▼                      ▼
+                       ┌────────────────────┐      Log decision
+                       │ executeRemediation │      (no action)
+                       │                    │
+                       │ SSM Run Command    │
+                       │ • Send command     │
+                       │ • Poll completion  │
+                       │ • Verify recovery  │
+                       └────────────────────┘
+                                   │
+                                   ▼
+                         EC2 (aiops-demo-app)
+                         systemctl restart
+                                   │
+                                   ▼
+                    Wait for fresh CloudWatch datapoint
+                                   │
+                        ┌──────────┴──────────┐
+                        │                     │
+                   CPU ≤ 70%             CPU > 70%
+                        │                     │
+                        ▼                     ▼
+                    RESOLVED          REMEDIATION_FAILED
+                        │                     │
+                        └──────────┬──────────┘
+                                   ▼
+                          SNS Notification
+                           (aiops-incidents)
 ```
 
-CI/CD and AIOps both reach EC2 through SSM, for completely different reasons:
+### Analytics & Reporting Pipeline
 
-| Path | Purpose |
-|---|---|
-| GitHub Actions → SSM | Deploy application releases |
-| AIOps Lambda → SSM | Remediate incidents autonomously |
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                      DAILY ANALYTICS & REPORTING                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+                    EventBridge Schedule
+                    (cron: 0 0 * * ? *)
+                    Daily at 00:00 UTC
+                              │
+                              ▼
+                  ┌───────────────────────┐
+                  │  Analytics Lambda     │
+                  │  (aiops-analytics)    │
+                  └───────────────────────┘
+                              │
+              ┌───────────────┴───────────────┐
+              │                               │
+              ▼                               ▼
+  ┌────────────────────┐        ┌─────────────────────┐
+  │  collectMetrics    │        │  aggregateLogs      │
+  │                    │        │                     │
+  │  CloudWatch        │        │  CloudWatch Logs    │
+  │  • CPU (CWAgent)   │        │  Insights Query     │
+  │  • Memory          │        │                     │
+  │  • Disk            │        │  • Total requests   │
+  │  • Network         │        │  • Error rates      │
+  │                    │        │  • Response times   │
+  │  Last 24 hours     │        │  • Top endpoints    │
+  └────────────────────┘        │  • Top errors       │
+                                └─────────────────────┘
+              │                               │
+              └───────────────┬───────────────┘
+                              │
+                              ▼
+                  Verified Statistics Object
+                              │
+                              ▼
+                  ┌───────────────────────┐
+                  │  analyzeDailyReport   │
+                  │                       │
+                  │  Gemini AI interprets │
+                  │  pre-calculated data  │
+                  │                       │
+                  │  • Summary            │
+                  │  • Trends             │
+                  │  • Anomalies          │
+                  │  • Issues             │
+                  │  • Recommendations    │
+                  └───────────────────────┘
+                              │
+                              ▼
+                      formatReport
+                      (stats + insights)
+                              │
+                              ▼
+                     SNS Notification
+                      (aiops-reports)
+```
+
+### CI/CD Pipeline
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    CONTINUOUS DEPLOYMENT PIPELINE                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+              Push to main (demo-app/**)
+                          │
+                          ▼
+                  GitHub Actions
+                  • npm ci
+                  • npm test
+                  • npm run build
+                          │
+                          ▼
+              Package: aiops-demo-app.tgz
+                          │
+                          ▼
+              AWS OIDC Authentication
+       (AIOpsDemoAppDeploymentRole)
+                          │
+                          ▼
+              S3 Bucket (immutable)
+         releases/<sha>/aiops-demo-app.tgz
+                          │
+                          ▼
+              SSM Run Command → EC2
+                          │
+      ┌───────────────────┼───────────────────┐
+      │                   │                   │
+      ▼                   ▼                   ▼
+  Download          Install deps      Atomic symlink
+  from S3           npm ci            /opt/.../current
+                                              │
+                                              ▼
+                                   systemctl restart
+                                              │
+                                              ▼
+                                   Readiness probe
+                                   Health check
+                                   Version verify
+                                              │
+                            ┌─────────────────┴─────────────────┐
+                            │                                   │
+                         SUCCESS                             FAILURE
+                            │                                   │
+                     Deployment                          Rollback to
+                      complete                          previous release
+```
+
+### Key Integration Points
+
+Both CI/CD and AIOps reach EC2 through SSM, but for completely different purposes:
+
+| Component             | Path                                            | Purpose                          | Frequency          |
+| --------------------- | ----------------------------------------------- | -------------------------------- | ------------------ |
+| **CI/CD**             | GitHub Actions → S3 → SSM → EC2                 | Deploy application releases      | On code push       |
+| **Incident Response** | CloudWatch → EventBridge → Lambda → SSM → EC2   | Remediate incidents autonomously | On alarm trigger   |
+| **Analytics**         | EventBridge Schedule → Lambda → CloudWatch APIs | Collect and report metrics       | Daily at 00:00 UTC |
 
 ---
 
@@ -101,6 +248,7 @@ A CloudWatch alarm (`AIOps-Test-HighCPU`) monitors `CPUUtilization` on the demo 
 ### 2. Investigation
 
 The Coordinator calls `collectIncidentContext`, which queries:
+
 - **EC2 API** — instance state, instance type, health status, AZ, IP addresses
 - **CloudWatch** — latest CPU utilization datapoint (10-minute window)
 
@@ -108,7 +256,7 @@ This context is passed to the AI and the policy. The AI never has direct AWS acc
 
 ### 3. AI Analysis
 
-`analyzeIncident` sends the incident context to **Gemini 2.0 Flash Lite** with a strict prompt. The model returns a structured JSON recommendation:
+`analyzeIncident` sends the incident context to **Gemini 3.5 Flash Lite** (`gemini-3.5-flash-lite`) with a strict prompt. The model returns a structured JSON recommendation:
 
 ```json
 {
@@ -125,17 +273,16 @@ The response is validated — only `restart_application` and `no_action` are acc
 
 ### 4. Policy Evaluation
 
-`evaluateRecommendation` independently verifies every safety condition before approving any action. The AI's `requiresApproval` field is advisory only — it cannot bypass the checks.
+`evaluateRecommendation` is the authoritative, deterministic safety gate. It re-verifies the evidence itself and never trusts the model's self-assessment — AI `confidence` and `requiresApproval` are **advisory only** and play no role in the decision.
 
-| Condition | Failure outcome |
-|---|---|
-| `instanceState === "running"` | `REJECTED` |
-| `healthStatus === "ok"` | `REJECTED` |
-| `cpuUtilization > 70` | `REJECTED` |
-| `confidence >= 0.90` | `APPROVAL_REQUIRED` |
-| `requiresApproval === false` | `APPROVAL_REQUIRED` if true |
+| #   | Condition (checked in order)                                     | Failure outcome |
+| --- | ---------------------------------------------------------------- | --------------- |
+| 1   | Action is on the allow-list (`restart_application`, `no_action`) | `REJECTED`      |
+| 2   | `instanceState === "running"`                                    | `REJECTED`      |
+| 3   | `healthStatus === "ok"`                                          | `REJECTED`      |
+| 4   | `cpuUtilization > 70` (fresh CloudWatch datapoint)               | `REJECTED`      |
 
-Only when all five conditions pass does the policy return `APPROVED`.
+`no_action` is always approved and skips remediation. When a restart is requested, all four conditions must pass for the policy to return `APPROVED` — otherwise it returns `REJECTED`. The policy never returns `APPROVAL_REQUIRED`.
 
 ### 5. Remediation
 
@@ -146,8 +293,9 @@ restart_application  →  systemctl restart aiops-demo-app
 ```
 
 The flow:
+
 1. `ssm:SendCommand` targets the specific EC2 instance from the trusted alarm event
-2. `ssm:GetCommandInvocation` polls until the command reaches a terminal state (max 60 s)
+2. `ssm:GetCommandInvocation` polls until the command reaches a terminal state (max 120 s)
 3. If the command fails, returns `REMEDIATION_FAILED` immediately
 
 ### 6. Verification
@@ -166,12 +314,51 @@ Fresh datapoint received?
 
 ### 7. Notification
 
-The Coordinator publishes to SNS:
+The Coordinator publishes to the `aiops-incidents` SNS topic, which has an email subscription:
 
-| Outcome | Subject |
-|---|---|
-| `RESOLVED` | `AIOps Incident Resolved` |
+| Outcome              | Subject                                                          |
+| -------------------- | ---------------------------------------------------------------- |
+| `RESOLVED`           | `AIOps Incident Resolved`                                        |
 | `REMEDIATION_FAILED` | `AIOps Incident Escalated` with `ENGINEER_INTERVENTION_REQUIRED` |
+
+Email bodies contain only pipeline-verified facts — instance, action, CPU before/after, and status — never the AI's narrative. If the policy **rejects** the AI recommendation, remediation is skipped and no email is sent; the decision is recorded in CloudWatch Logs.
+
+> Both SNS topics require a one-time email confirmation. AWS sends a **"Confirm subscription"** message to each address after the first deploy — reports and incident emails are not delivered until it is confirmed.
+
+---
+
+## Daily Report Pipeline
+
+A second, scheduled pipeline turns daily operations data into an AI-written report.
+
+```
+EventBridge Schedule (cron 0 0 * * ? * — 00:00 UTC daily)
+        ↓
+Analytics Lambda (aiops-analytics, 300 s timeout)
+        ↓
+Deterministic aggregation of the last 24 hours:
+  • collectMetrics — CloudWatch metrics (CPU, memory, disk, network)
+  • aggregateLogs  — CloudWatch Logs Insights over the app log group
+        ↓
+Gemini AI (analyzeDailyReport) — insights only, numbers are pre-calculated
+        ↓
+formatReport — verified statistics + AI insights
+  (summary, performance trends, anomalies, top issues, recommendations)
+        ↓
+SNS aiops-reports → daily report email
+```
+
+The design principles mirror the incident pipeline:
+
+- Metrics and logs are collected deterministically before any AI involvement
+- The model never recalculates numbers — it only interprets verified statistics
+- The reports topic (`aiops-reports`) is separate from incidents (`aiops-incidents`)
+
+To generate a report on demand:
+
+```bash
+aws lambda invoke --function-name aiops-analytics /dev/null
+```
 
 ---
 
@@ -207,7 +394,7 @@ aiops-aws/
 │   │   └── analyzeIncident.ts      # Gemini AI integration
 │   ├── policy/
 │   │   ├── evaluateRecommendation.ts       # Safety policy engine
-│   │   └── evaluateRecommendation.test.ts  # 13 policy unit tests
+│   │   └── evaluateRecommendation.test.ts  # 15 policy unit tests
 │   └── remediation/
 │       └── executeRemediation.ts   # SSM execution + CPU verification
 ├── template.yaml                   # SAM infrastructure definition
@@ -230,15 +417,29 @@ Queries EC2 (`DescribeInstances`, `DescribeInstanceStatus`) and CloudWatch (`Get
 
 ### `src/ai/analyzeIncident.ts`
 
-Sends the incident context to Gemini 2.0 Flash Lite using `application/json` response mode. Validates the response structure and rejects any recommendation with an unsupported action, out-of-range confidence, or missing fields.
+Sends the incident context to Gemini 3.5 Flash Lite (`gemini-3.5-flash-lite`) using `application/json` response mode. Validates the response structure and rejects any recommendation with an unsupported action, out-of-range confidence, or missing fields.
 
 ### `src/policy/evaluateRecommendation.ts`
 
-The authoritative safety gate. Independently verifies instance state, health status, CPU threshold, AI confidence, and the `requiresApproval` flag — in that order. Returns `APPROVED`, `APPROVAL_REQUIRED`, or `REJECTED` with a reason. Covered by 13 unit tests.
+The authoritative safety gate. Independently verifies, in order: the action is allow-listed, the instance is running, the instance is healthy, and a fresh CloudWatch datapoint still exceeds the CPU threshold. AI `confidence` and `requiresApproval` are advisory only — they never influence the decision. Returns `APPROVED` or `REJECTED` with a reason.
+
+**Covered by 15 comprehensive unit tests:**
+
+- Approval scenarios (5 tests) — validates all passing conditions
+- AI advisory flags (3 tests) — confirms confidence/requiresApproval don't override policy
+- Rejection scenarios (7 tests) — unsupported action, wrong state, unhealthy, low CPU
 
 ### `src/remediation/executeRemediation.ts`
 
 Executes the remediation via SSM using a hardcoded command map, polls for completion, then waits for a fresh post-remediation CloudWatch datapoint to confirm CPU recovery. Returns `RESOLVED`, `REMEDIATION_FAILED`, or `SKIPPED`.
+
+### `src/analytics/dailyReport.ts`
+
+The Analytics Engine entry point. Triggered nightly by EventBridge, it aggregates the last 24 hours of CloudWatch system metrics (`collectMetrics`) and application request logs (`aggregateLogs`, via CloudWatch Logs Insights), passes the verified statistics to Gemini for interpretation, formats the combined report, and publishes it to the `aiops-reports` SNS topic.
+
+### `src/ai/analyzeDailyReport.ts`
+
+Sends the pre-calculated daily statistics to Gemini (`gemini-3.5-flash-lite`). The prompt forbids recalculating numbers — the model only provides a summary, performance trends, anomalies, top issues, and recommendations as structured JSON.
 
 ---
 
@@ -246,16 +447,19 @@ Executes the remediation via SSM using a hardcoded command map, polls for comple
 
 The demo workload is a Node.js / Express application (`aiops-demo-app`) running as a systemd service on EC2. It exposes:
 
-| Endpoint | Description |
-|---|---|
-| `GET /` | Dashboard — shows version, uptime, live CPU |
-| `GET /health/live` | Liveness probe |
-| `GET /health/ready` | Readiness probe |
-| `GET /api/system` | JSON — version, uptime, CPU |
+| Endpoint                                   | Description                                  |
+| ------------------------------------------ | -------------------------------------------- |
+| `GET /`                                    | Dashboard — shows version, uptime, live CPU  |
+| `GET /health`                              | Liveness probe                               |
+| `GET /health/ready`                        | Readiness probe                              |
+| `GET /api/system`                          | JSON — version, uptime, CPU/memory           |
+| `GET /api/system/cpu`                      | JSON — CPU sample and core count             |
 | `POST /internal/simulate/cpu?duration=<s>` | Start CPU simulation (requires Bearer token) |
-| `DELETE /internal/simulate/cpu` | Stop CPU simulation (requires Bearer token) |
+| `POST /internal/simulate/cpu/stop`         | Stop CPU simulation (requires Bearer token)  |
 
 The CPU simulation spawns worker threads to generate real CPU load, which triggers the CloudWatch alarm and drives the AIOps workflow.
+
+All HTTP requests are logged as structured JSON to `/var/log/aiops-demo-app/app.log` (5xx responses also to `error.log`) by a request-logging middleware. The CloudWatch Agent ships these files to the `/aiops/demo-app/application` and `/aiops/demo-app/errors` log groups, where the daily Analytics Engine aggregates them.
 
 ---
 
@@ -290,12 +494,14 @@ Authentication uses GitHub Actions OIDC — no long-lived AWS credentials are st
 The system is designed so that no single component can cause unintended remediation.
 
 **The AI cannot:**
+
 - Execute AWS API calls
 - Supply shell commands
 - Override the safety policy
 - Approve its own recommendation
 
 **The policy independently verifies:**
+
 - Instance is in `running` state
 - Instance health status is `ok`
 - CPU utilization exceeds the alarm threshold (70%)
@@ -303,13 +509,15 @@ The system is designed so that no single component can cause unintended remediat
 - AI has not flagged the recommendation for human review
 
 **SSM permissions are scoped to:**
+
 - A single document: `AWS-RunShellScript`
 - A single instance: the stack-managed EC2 resource
 
 **The command map is hardcoded:**
+
 ```typescript
 const REMEDIATION_COMMANDS = {
-  restart_application: "systemctl restart aiops-demo-app"
+  restart_application: "systemctl restart aiops-demo-app",
 };
 ```
 
@@ -322,11 +530,64 @@ The incident is only marked `RESOLVED` when CloudWatch returns a CPU datapoint w
 
 ## Prerequisites
 
-- AWS CLI configured for account `056793557028`, region `us-east-1`
-- AWS SAM CLI
-- Node.js 22
-- An existing S3 bucket for deployment artifacts
-- A Gemini API key (Google AI Studio)
+### Required Tools
+
+- **AWS CLI** — configured for your AWS account, region `us-east-1`
+- **AWS SAM CLI** — for infrastructure deployment
+- **Node.js 22** — for building the demo application
+- **jq** — for JSON processing in deployment scripts
+
+### AWS Resources
+
+- **S3 Bucket** — for immutable deployment artifacts
+
+  ```bash
+  aws s3 mb s3://aiops-demo-deploy-$(aws sts get-caller-identity --query Account --output text)
+  ```
+
+- **GitHub OIDC Provider** — for CI/CD authentication (if using GitHub Actions)
+
+  ```bash
+  aws iam create-open-id-connect-provider \
+    --url https://token.actions.githubusercontent.com \
+    --client-id-list sts.amazonaws.com \
+    --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
+  ```
+
+- **GitHub Deployment Role** — create `AIOpsDemoAppDeploymentRole` with trust policy:
+
+  ```json
+  {
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Effect": "Allow",
+        "Principal": {
+          "Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com"
+        },
+        "Action": "sts:AssumeRoleWithWebIdentity",
+        "Condition": {
+          "StringEquals": {
+            "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+          },
+          "StringLike": {
+            "token.actions.githubusercontent.com:sub": "repo:<GITHUB_ORG>/<GITHUB_REPO>:ref:refs/heads/main"
+          }
+        }
+      }
+    ]
+  }
+  ```
+
+  Attach policies:
+  - `AmazonS3FullAccess` (scoped to deployment bucket)
+  - `AmazonSSMFullAccess` (scoped to target EC2 instance)
+
+### API Keys
+
+- **Gemini API Key** — from [Google AI Studio](https://aistudio.google.com/apikey)
+  - Free tier: 15 requests per minute
+  - Required model: `gemini-3.5-flash-lite`
 
 ---
 
@@ -337,20 +598,27 @@ sam build
 sam deploy \
   --parameter-overrides \
     "GeminiApiKey=<your-key> \
-     DeploymentBucketName=aiops-demo-deploy-<account-id>"
+     ReportsEmailAddress=<you@example.com> \
+     IncidentEmailAddress=<you@example.com>"
 ```
+
+`DeploymentBucketName` has a default of `aiops-demo-deploy-<account-id>` — override it only if you use a different bucket. `ReportsEmailAddress` and `IncidentEmailAddress` are required.
 
 SAM creates and manages:
 
-| Resource | Description |
-|---|---|
-| `AIOpsEC2` | EC2 instance running the demo workload |
-| `AIOpsEC2SecurityGroup` | Security group for the instance |
-| `AIOpsEC2InstanceRole` | IAM role with SSM and S3 read access |
-| `AIOpsHighCPUAlarm` | CloudWatch alarm — CPU > 70% for 5 minutes |
-| `IncidentTopic` | SNS topic for incident notifications |
-| `CoordinatorFunction` | AIOps Coordinator Lambda (480 s timeout) |
-| `IncidentEventRule` | EventBridge rule — routes ALARM events to Lambda |
+| Resource                                | Description                                                   |
+| --------------------------------------- | ------------------------------------------------------------- |
+| `AIOpsEC2`                              | EC2 instance running the demo workload                        |
+| `AIOpsEC2SecurityGroup`                 | Security group for the instance                               |
+| `AIOpsEC2InstanceRole`                  | IAM role with SSM, S3 read, and CloudWatch Agent write access |
+| `AIOpsHighCPUAlarm`                     | CloudWatch alarm — CPU > 70% for 5 minutes                    |
+| `ApplicationLogGroup` / `ErrorLogGroup` | Log groups for app/error logs (30-day retention)              |
+| `IncidentTopic`                         | SNS topic `aiops-incidents` with email subscription           |
+| `CoordinatorFunction`                   | AIOps Coordinator Lambda (540 s timeout)                      |
+| `IncidentEventRule`                     | EventBridge rule — routes ALARM events to the Coordinator     |
+| `AnalyticsFunction`                     | AIOps Analytics Engine Lambda (300 s timeout)                 |
+| `ReportsTopic`                          | SNS topic `aiops-reports` with email subscription             |
+| `DailyReportSchedule`                   | EventBridge schedule — Analytics Lambda daily at 00:00 UTC    |
 
 After deployment, retrieve the instance ID:
 
@@ -390,18 +658,118 @@ aws ssm send-command \
   --parameters 'commands=["sed -i s/change-me/<strong-token>/ /opt/aiops-demo-app/config/production.env"]'
 ```
 
+> **CloudWatch Agent requirement:** the daily report pipeline depends on the CloudWatch Agent shipping `/var/log/aiops-demo-app/app.log` and `error.log` to the `/aiops/demo-app/application` and `/aiops/demo-app/errors` log groups. The instance role already grants `CloudWatchAgentServerPolicy`; make sure the AMI used for `AmiId` has the agent installed and configured (or extend `ec2-setup.sh` to install it). Without it, the log-derived sections of the daily report will be empty.
+
+#### CloudWatch Agent Configuration
+
+Create `/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json` on the EC2 instance:
+
+```json
+{
+  "agent": {
+    "metrics_collection_interval": 60,
+    "run_as_user": "cwagent"
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/aiops-demo-app/app.log",
+            "log_group_name": "/aiops/demo-app/application",
+            "log_stream_name": "{instance_id}",
+            "retention_in_days": 30
+          },
+          {
+            "file_path": "/var/log/aiops-demo-app/error.log",
+            "log_group_name": "/aiops/demo-app/errors",
+            "log_stream_name": "{instance_id}",
+            "retention_in_days": 30
+          }
+        ]
+      }
+    }
+  },
+  "metrics": {
+    "namespace": "CWAgent",
+    "metrics_collected": {
+      "cpu": {
+        "measurement": [
+          {
+            "name": "cpu_usage_active",
+            "rename": "cpu_usage_active",
+            "unit": "Percent"
+          }
+        ],
+        "metrics_collection_interval": 60,
+        "totalcpu": false
+      },
+      "disk": {
+        "measurement": [
+          {
+            "name": "used_percent",
+            "rename": "disk_used_percent",
+            "unit": "Percent"
+          }
+        ],
+        "metrics_collection_interval": 60,
+        "resources": ["*"]
+      },
+      "mem": {
+        "measurement": [
+          {
+            "name": "mem_used_percent",
+            "rename": "mem_used_percent",
+            "unit": "Percent"
+          }
+        ],
+        "metrics_collection_interval": 60
+      },
+      "net": {
+        "measurement": [
+          {
+            "name": "bytes_sent",
+            "rename": "net_bytes_sent",
+            "unit": "Bytes"
+          },
+          {
+            "name": "bytes_recv",
+            "rename": "net_bytes_recv",
+            "unit": "Bytes"
+          }
+        ],
+        "metrics_collection_interval": 60,
+        "resources": ["ens5"]
+      }
+    }
+  }
+}
+```
+
+Start the agent:
+
+```bash
+sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config \
+  -m ec2 \
+  -s \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+```
+
+> **Note:** The analytics code expects specific metric names (`cpu_usage_active`, `mem_used_percent`, `disk_used_percent`) and dimensions (device: `nvme0n1p1`, interface: `ens5`). Adjust `collectMetrics.ts` if your instance uses different device names.
+
 ---
 
 ## 3 — Configure GitHub Actions
 
 In your GitHub repository → **Settings → Environments → production**, add the following variables:
 
-| Variable | Value |
-|---|---|
-| `AWS_ACCOUNT_ID` | Your 12-digit AWS account ID |
-| `AWS_REGION` | `us-east-1` |
+| Variable            | Value                            |
+| ------------------- | -------------------------------- |
+| `AWS_ACCOUNT_ID`    | Your 12-digit AWS account ID     |
+| `AWS_REGION`        | `us-east-1`                      |
 | `DEPLOYMENT_BUCKET` | `aiops-demo-deploy-<account-id>` |
-| `EC2_INSTANCE_ID` | Instance ID from SAM outputs |
+| `EC2_INSTANCE_ID`   | Instance ID from SAM outputs     |
 
 No secrets are required — authentication uses OIDC.
 
@@ -478,32 +846,50 @@ The deployment script performs an atomic symlink swap and automatically rolls ba
 
 ### Lambda timeout
 
-The Coordinator Lambda is configured with a **480-second timeout** to accommodate the full worst-case workflow:
+The Coordinator Lambda is configured with a **540-second timeout** to accommodate the full worst-case workflow:
 
-| Stage | Max duration |
-|---|---|
-| Investigation + AI analysis | ~10 s |
-| SSM command poll | 60 s |
-| CloudWatch verification poll | 360 s |
-| **Total** | **~430 s** |
+| Stage                        | Max duration |
+| ---------------------------- | ------------ |
+| Investigation + AI analysis  | ~10 s        |
+| SSM command poll             | 120 s        |
+| CloudWatch verification poll | 360 s        |
+| **Total**                    | **~490 s**   |
 
 ### CloudWatch alarm settings
 
-| Setting | Value |
-|---|---|
-| Metric | `AWS/EC2 CPUUtilization` |
-| Statistic | Average |
-| Period | 300 s (5 minutes) |
-| Evaluation periods | 1 |
-| Threshold | > 70% |
-| Missing data treatment | `notBreaching` |
+| Setting                | Value                    |
+| ---------------------- | ------------------------ |
+| Metric                 | `AWS/EC2 CPUUtilization` |
+| Statistic              | Average                  |
+| Period                 | 300 s (5 minutes)        |
+| Evaluation periods     | 1                        |
+| Threshold              | > 70%                    |
+| Missing data treatment | `notBreaching`           |
+
+### Analytics Engine
+
+| Setting        | Value                                                                      |
+| -------------- | -------------------------------------------------------------------------- |
+| Function name  | `aiops-analytics`                                                          |
+| Timeout        | 300 s                                                                      |
+| Schedule       | `cron(0 0 * * ? *)` — 00:00 UTC daily                                      |
+| Log sources    | `/aiops/demo-app/application`, `/aiops/demo-app/errors` (30-day retention) |
+| Metrics window | Last 24 hours                                                              |
+
+### IAM permissions (Analytics Lambda)
+
+| Permission                                                  | Resource scope                             |
+| ----------------------------------------------------------- | ------------------------------------------ |
+| `cloudwatch:GetMetricStatistics`                            | `*` (read-only, no resource ARN supported) |
+| `logs:StartQuery`, `logs:GetQueryResults`, `logs:StopQuery` | The two application log group ARNs         |
+| `sns:Publish`                                               | Specific `ReportsTopic` ARN                |
 
 ### IAM permissions (Coordinator Lambda)
 
-| Permission | Resource scope |
-|---|---|
-| `ec2:DescribeInstances`, `ec2:DescribeInstanceStatus` | `*` (read-only, no resource ARN supported) |
-| `cloudwatch:GetMetricStatistics` | `*` (read-only, no resource ARN supported) |
-| `ssm:SendCommand` | Specific document + specific EC2 instance |
-| `ssm:GetCommandInvocation` | `*` (command invocation ARNs are not scopeable) |
-| `sns:Publish` | Specific `IncidentTopic` ARN |
+| Permission                                            | Resource scope                                  |
+| ----------------------------------------------------- | ----------------------------------------------- |
+| `ec2:DescribeInstances`, `ec2:DescribeInstanceStatus` | `*` (read-only, no resource ARN supported)      |
+| `cloudwatch:GetMetricStatistics`                      | `*` (read-only, no resource ARN supported)      |
+| `ssm:SendCommand`                                     | Specific document + specific EC2 instance       |
+| `ssm:GetCommandInvocation`                            | `*` (command invocation ARNs are not scopeable) |
+| `sns:Publish`                                         | Specific `IncidentTopic` ARN                    |

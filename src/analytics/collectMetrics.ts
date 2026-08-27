@@ -15,20 +15,20 @@ export interface SystemMetrics {
 async function getStats(
   namespace: string,
   metricName: string,
-  instanceId: string,
+  dimensions: { Name: string; Value: string }[],
   startTime: Date,
   endTime: Date,
-  statistics: string[]
+  statistics: ("Average" | "Maximum" | "Sum")[]
 ): Promise<{ average: number; max: number; sum: number }> {
   const response = await cloudWatch.send(
     new GetMetricStatisticsCommand({
       Namespace: namespace,
       MetricName: metricName,
-      Dimensions: [{ Name: "InstanceId", Value: instanceId }],
+      Dimensions: dimensions,
       StartTime: startTime,
       EndTime: endTime,
       Period: 3600,
-      Statistics: statistics as ("Average" | "Maximum" | "Sum")[]
+      Statistics: statistics
     })
   );
 
@@ -49,12 +49,24 @@ export async function collectSystemMetrics(
   startTime: Date,
   endTime: Date
 ): Promise<SystemMetrics> {
+  const id = { Name: "InstanceId", Value: instanceId };
+
   const [cpu, memory, disk, netIn, netOut] = await Promise.all([
-    getStats("CWAgent", "cpu_usage_active", instanceId, startTime, endTime, ["Average", "Maximum"]),
-    getStats("CWAgent", "mem_used_percent", instanceId, startTime, endTime, ["Average", "Maximum"]),
-    getStats("CWAgent", "disk_used_percent", instanceId, startTime, endTime, ["Average", "Maximum"]),
-    getStats("CWAgent", "net_bytes_recv", instanceId, startTime, endTime, ["Sum"]),
-    getStats("CWAgent", "net_bytes_sent", instanceId, startTime, endTime, ["Sum"])
+    getStats("CWAgent", "cpu_usage_active",
+      [id, { Name: "cpu", Value: "cpu-total" }],
+      startTime, endTime, ["Average", "Maximum"]),
+    getStats("CWAgent", "mem_used_percent",
+      [id],
+      startTime, endTime, ["Average", "Maximum"]),
+    getStats("CWAgent", "disk_used_percent",
+      [id, { Name: "path", Value: "/" }, { Name: "device", Value: "nvme0n1p1" }, { Name: "fstype", Value: "xfs" }],
+      startTime, endTime, ["Average", "Maximum"]),
+    getStats("CWAgent", "net_bytes_recv",
+      [id, { Name: "interface", Value: "ens5" }],
+      startTime, endTime, ["Sum"]),
+    getStats("CWAgent", "net_bytes_sent",
+      [id, { Name: "interface", Value: "ens5" }],
+      startTime, endTime, ["Sum"])
   ]);
 
   return {

@@ -65,23 +65,21 @@ export async function aggregateApplicationLogs(
 ): Promise<LogAggregation> {
   const [summaryRows, endpointRows, errorRows] = await Promise.all([
     runQuery(logGroup, `
-      fields statusCode, durationMs
-      | filter type = "http_request"
+      filter type = "http_request"
       | stats
           count() as total,
-          count(statusCode < 400) as successful,
-          count(statusCode >= 400 and statusCode < 500) as clientErrors,
-          count(statusCode >= 500) as serverErrors,
+          sum(statusCode < 400) as successful,
+          sum(statusCode >= 400 and statusCode < 500) as clientErrors,
+          sum(statusCode >= 500) as serverErrors,
           avg(durationMs) as avgDuration,
           pct(durationMs, 95) as p95Duration
     `, startTime, endTime),
 
     runQuery(logGroup, `
-      fields path, statusCode, durationMs
-      | filter type = "http_request"
+      filter type = "http_request"
       | stats
           count() as count,
-          count(statusCode >= 400) as errorCount,
+          sum(statusCode >= 400) as errorCount,
           avg(durationMs) as avgDuration,
           pct(durationMs, 95) as p95Duration
         by path
@@ -90,8 +88,7 @@ export async function aggregateApplicationLogs(
     `, startTime, endTime),
 
     runQuery(logGroup, `
-      fields path, statusCode
-      | filter type = "http_request" and statusCode >= 400
+      filter type = "http_request" and statusCode >= 400
       | stats count() as count by path, statusCode
       | sort count desc
       | limit 10
